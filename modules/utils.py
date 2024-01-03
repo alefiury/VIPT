@@ -3,8 +3,8 @@ import re
 import warnings
 from itertools import groupby
 from pathlib import Path
-from typing import Any
 from logging import getLogger
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import matplotlib
@@ -17,7 +17,7 @@ from torch import nn
 LOG = getLogger(__name__)
 IS_COLAB = os.getenv("COLAB_RELEASE_TAG", False)
 
-def _substitute_if_same_shape(to_: dict[str, Any], from_: dict[str, Any]) -> None:
+def _substitute_if_same_shape(to_: Dict[str, Any], from_: Dict[str, Any]) -> None:
     not_in_to = list(filter(lambda x: x not in to_, from_.keys()))
     not_in_from = list(filter(lambda x: x not in from_, to_.keys()))
     if not_in_to:
@@ -46,18 +46,18 @@ def _substitute_if_same_shape(to_: dict[str, Any], from_: dict[str, Any]) -> Non
         )
 
 
-def safe_load(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+def safe_load(model: torch.nn.Module, state_dict: Dict[str, Any]) -> None:
     model_state_dict = model.state_dict()
     _substitute_if_same_shape(model_state_dict, state_dict)
     model.load_state_dict(model_state_dict)
 
 
 def load_checkpoint(
-    checkpoint_path: Path | str,
+    checkpoint_path: Union[Path, str],
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer | None = None,
+    optimizer: Union[torch.optim.Optimizer, None] = None,
     skip_optimizer: bool = False,
-) -> tuple[torch.nn.Module, torch.optim.Optimizer | None, float, int]:
+) -> Tuple[torch.nn.Module, Union[torch.optim.Optimizer, None], float, int]:
     if not Path(checkpoint_path).is_file():
         raise FileNotFoundError(f"File {checkpoint_path} not found")
     with Path(checkpoint_path).open("rb") as f:
@@ -93,7 +93,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     learning_rate: float,
     iteration: int,
-    checkpoint_path: Path | str,
+    checkpoint_path: Union[Path, str],
 ) -> None:
     LOG.info(
         "Saving model and optimizer state at epoch {} to {}".format(
@@ -117,7 +117,7 @@ def save_checkpoint(
 
 
 def clean_checkpoints(
-    path_to_models: Path | str, n_ckpts_to_keep: int = 2, sort_by_time: bool = True
+    path_to_models: Union[Path, str], n_ckpts_to_keep: int = 2, sort_by_time: bool = True
 ) -> None:
     """Freeing up space by deleting saved ckpts
 
@@ -161,7 +161,7 @@ def clean_checkpoints(
                 to_delete.unlink()
 
 
-def latest_checkpoint_path(dir_path: Path | str, regex: str = "G_*.pth") -> Path | None:
+def latest_checkpoint_path(dir_path: Union[Path, str], regex: str = "G_*.pth") -> Union[Path, None]:
     dir_path = Path(dir_path)
     name_key = lambda p: int(re.match(r"._(\d+)\.pth", p.name).group(1))
     paths = list(sorted(dir_path.glob(regex), key=name_key))

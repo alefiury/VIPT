@@ -5,15 +5,26 @@ import numpy as np
 # Load yaml
 from omegaconf import OmegaConf
 import torch
+import lightning as pl
+from lightning.pytorch.loggers import WandbLogger
 from modules.model import VIPT
 from data.ljspeech import ljspeech
-from data.cleaners import english_cleaners2
-from data.utils import symbols_to_ids, ids_to_symbols
-from data.symbols import symbols_to_ids_dict
+from lightning.pytorch.callbacks import DeviceStatsMonitor, RichProgressBar
+from data.text.cleaners import english_cleaners2
+from data.text.utils import symbols_to_ids, ids_to_symbols
+from data.text.symbols import symbols_to_ids_dict
+from data.dataloader import TextAudioLoader, TextAudioCollate
+from train import VIPTLightning
+
 
 def main():
     # Load config
     config = OmegaConf.load("configs/default.yaml")
+
+
+    # print(config)
+
+    # print([config[b] for b in config.keys()])
 
     # print(config)
     # # Initialize the model
@@ -53,15 +64,53 @@ def main():
 
     metadata = ljspeech("/media/alefiury/2 TB/Projetos/Alcateia/datasets/LJSpeech-1.1")
 
-    print(metadata[0])
+    train_rate = 0.9
+    val_rate = 0.1
 
-    print(english_cleaners2(metadata[0]["text"]))
+    train_metadata = metadata[:int(len(metadata) * train_rate)]
+    val_metadata = metadata[int(len(metadata) * train_rate):]
 
-    basic_symbols = symbols_to_ids(english_cleaners2(metadata[0]["text"]))
+    train_dataset = TextAudioLoader(train_metadata, config.data)
+    val_dataset = TextAudioLoader(val_metadata, config.data)
+    collate_fn = TextAudioCollate()
 
-    print(basic_symbols)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=config.data.batch_size,
+        num_workers=config.train.num_workers,
+        shuffle=True,
+        collate_fn=collate_fn,
+    )
 
-    print(ids_to_symbols(basic_symbols))
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=config.data.batch_size,
+        num_workers=config.train.num_workers,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+
+    model_pl = VIPTLightning(hparams=config)
+
+    print(model_pl)
+
+    logger = WandbLogger(project="VIPT", name="VIPT-test", entity="alefiury")
+
+    trainer = pl.Trainer(
+        logger=logger,
+        val_check_interval=config.train.eval_interval,
+        max_epochs=config.train.epochs,
+        check_val_every_n_epoch=None,
+        precision="16-mixed" if config.train.fp16_run else "bf16-mixed" if config.train.get("bf16_run", False) else 32,
+        callbacks=[RichProgressBar(), DeviceStatsMonitor()],
+        benchmark=True,
+        enable_checkpointing=False,
+        devices=[0],
+    )
+
+    trainer.fit(model_pl, train_loader, val_loader)
+
+
 
 if __name__ == '__main__':
     main()

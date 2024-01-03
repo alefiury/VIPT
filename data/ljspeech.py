@@ -11,5 +11,5 @@ def ljspeech(root_path, **kwargs):  # pylint: disable=unused-argument
             cols = line.split("|")
             wav_file = os.path.join(root_path, "wavs", cols[0] + ".wav")
             text = cols[2]
-            items.append({"text": text, "audio_file": wav_file, "speaker_name": speaker_name, "root_path": root_path})
+            items.append({"text": text, "audiopath": wav_file, "speaker_name": speaker_name, "root_path": root_path, "language": "en"})
     return items

@@ -1,3 +1,31 @@
+train:
+    log_interval: 100
+    eval_interval: 200
+    seed: 1234
+    epochs: 10000
+    learning_rate: 0.0001
+    betas:
+        - 0.8
+        - 0.99
+    eps: 1e-9
+    batch_size: 16
+    fp16_run: false
+    bf16_run: false
+    lr_decay: 0.999875
+    segment_size: 10240
+    init_lr_ratio: 1
+    warmup_epochs: 0
+    c_mel: 45
+    c_kl: 1.0
+    use_sr: true
+    max_speclen: 512
+    port: "8001"
+    keep_ckpts: 3
+    num_workers: 4
+    log_version: 0
+    ckpt_name_by_step: false
+    accumulate_grad_batches: 1
+
 model:
     hidden_channels: 192
     hidden_channels_ffn_text_encoder: 768
@@ -47,7 +75,21 @@ model:
         - 8
         - 2
         - 2
-    segment_size: 32
+    segment_size: 10240
+
+data:
+    max_wav_value: 32768.0
+    sampling_rate: 22050
+    filter_length: 1024
+    hop_length: 256
+    win_length: 1024
+    n_mel_channels: 80
+    mel_fmin: 0.0
+    mel_fmax: 8000.0
+    n_fft: 1024
+    use_spectral_norm: false
+    speaker_dict_path: "data/speaker_dict_ljspeech.json"
+    language_dict_path: "data/language_dict_ljspeech.json"
 
 # Additional global parameters (if needed)
 n_vocab: 1000

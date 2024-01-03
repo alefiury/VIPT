@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from typing import Dict
+import wandb
 import warnings
 from logging import getLogger
 from multiprocessing import cpu_count
@@ -17,7 +19,8 @@ from lightning.pytorch.tuner import Tuner
 from torch.cuda.amp import autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard.writer import SummaryWriter
+# from torch.utils.tensorboard.writer import SummaryWriter
+from lightning.pytorch.loggers import WandbLogger
 
 from modules.model import VIPT
 from modules.descriminators import MultiPeriodDiscriminator
@@ -31,19 +34,18 @@ LOG = getLogger(__name__)
 torch.set_float32_matmul_precision("high")
 
 
-class VitsLightning(pl.LightningModule):
-    def __init__(self, reset_optimizer: bool = False, **hparams: Any):
+class VIPTLightning(pl.LightningModule):
+    def __init__(self, reset_optimizer: bool = False, hparams: Dict = None):
         super().__init__()
         self._temp_epoch = 0  # Add this line to initialize the _temp_epoch attribute
-        self.save_hyperparameters("reset_optimizer")
-        self.save_hyperparameters(*[k for k in hparams.keys()])
+        self.save_hyperparameters(reset_optimizer)
+        self.save_hyperparameters(hparams)
+
         torch.manual_seed(self.hparams.train.seed)
         self.automatic_optimization = False
-
         self.net_g = VIPT(
-            self.hparams.data.filter_length // 2 + 1,
-            self.hparams.train.segment_size // self.hparams.data.hop_length,
             **self.hparams.model,
+            n_vocab=hparams.n_vocab
         )
 
         self.net_d = MultiPeriodDiscriminator(self.hparams.model.use_spectral_norm)
@@ -259,45 +261,6 @@ class VitsLightning(pl.LightningModule):
     def configure_optimizers(self):
         return [self.optim_g, self.optim_d], [self.scheduler_g, self.scheduler_d]
 
-    def log_image_dict(
-        self, image_dict: dict[str, Any], dataformats: str = "HWC"
-    ) -> None:
-        if not isinstance(self.logger, TensorBoardLogger):
-            warnings.warn("Image logging is only supported with TensorBoardLogger.")
-            return
-        writer: SummaryWriter = self.logger.experiment
-        for k, v in image_dict.items():
-            try:
-                writer.add_image(k, v, self.total_batch_idx, dataformats=dataformats)
-            except Exception as e:
-                warnings.warn(f"Failed to log image {k}: {e}")
-
-    def log_audio_dict(self, audio_dict: dict[str, Any]) -> None:
-        if not isinstance(self.logger, TensorBoardLogger):
-            warnings.warn("Audio logging is only supported with TensorBoardLogger.")
-            return
-        writer: SummaryWriter = self.logger.experiment
-        for k, v in audio_dict.items():
-            writer.add_audio(
-                k,
-                v.float(),
-                self.total_batch_idx,
-                sample_rate=self.hparams.data.sampling_rate,
-            )
-
-    def log_dict_(self, log_dict: dict[str, Any], **kwargs) -> None:
-        if not isinstance(self.logger, TensorBoardLogger):
-            warnings.warn("Logging is only supported with TensorBoardLogger.")
-            return
-        writer: SummaryWriter = self.logger.experiment
-        for k, v in log_dict.items():
-            writer.add_scalar(k, v, self.total_batch_idx)
-        kwargs["logger"] = False
-        self.log_dict(log_dict, **kwargs)
-
-    def log_(self, key: str, value: Any, **kwargs) -> None:
-        self.log_dict_({key: value}, **kwargs)
-
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
         self.net_g.train()
         self.net_d.train()
@@ -308,7 +271,7 @@ class VitsLightning(pl.LightningModule):
         # Generator
         # train
         self.toggle_optimizer(optim_g)
-        x, x_lengths, sid, lid, y, y_lengths = batch
+        x, x_lengths, y, y_lengths, wav, wav_lengths, sid, lid = batch
         output_dict = self.net_g(x, x_lengths, sid, lid, y, y_lengths)
         mel = spec_to_mel_torch(
             y,
@@ -342,29 +305,34 @@ class VitsLightning(pl.LightningModule):
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_prosody_kl
 
         # log loss
-        self.log_("lr", self.optim_g.param_groups[0]["lr"])
-        self.log_dict_(
+        self.log("lr", self.optim_g.param_groups[0]["lr"])
+        self.log_dict(
             {
-                "loss/g/total": loss_gen_all,
-                "loss/g/fm": loss_fm,
-                "loss/g/mel": loss_mel,
-                "loss/g/kl": loss_kl,
-                "loss/g/prosody_kl": loss_prosody_kl,
+                "loss-g_total": loss_gen_all,
+                "loss-g_fm": loss_fm,
+                "loss-g_mel": loss_mel,
+                "loss-g_kl": loss_kl,
+                "loss-g_prosody_kl": loss_prosody_kl,
             },
             prog_bar=True,
         )
 
         if self.total_batch_idx % self.hparams.train.log_interval == 0:
-            self.log_image_dict(
-                {
-                    "slice/mel_org": utils.plot_spectrogram_to_numpy(
+            examples = [
+                wandb.Image(
+                    utils.plot_spectrogram_to_numpy(
                         y_mel[0].data.cpu().float().numpy()
                     ),
-                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                        y_hat_mel[0].data.cpu().float().numpy()
+                    caption='target_mel'
+                ),
+                wandb.Image(utils.plot_spectrogram_to_numpy(
+                        y_mel[0].data.cpu().float().numpy()
                     ),
-                }
-            )
+                    caption='gen_mel'
+                ),
+            ]
+
+            self.logger.experiment.log({"mel_plots": examples})
 
         accumulate_grad_batches = self.hparams.train.get("accumulate_grad_batches", 1)
         should_update = (
@@ -373,7 +341,7 @@ class VitsLightning(pl.LightningModule):
         # optimizer
         self.manual_backward(loss_gen_all / accumulate_grad_batches)
         if should_update:
-            self.log_(
+            self.log(
                 "grad_norm_g", clip_grad_value_(self.net_g.parameters(), None)
             )
             optim_g.step()
@@ -393,13 +361,13 @@ class VitsLightning(pl.LightningModule):
             loss_disc_all = loss_disc
 
         # log loss
-        self.log_("loss/d/total", loss_disc_all, prog_bar=True)
+        self.log("loss-d_total", loss_disc_all, prog_bar=True)
 
         # optimizer
         self.manual_backward(loss_disc_all / accumulate_grad_batches)
         if should_update:
-            self.log_(
-                "grad_norm_d", clip_grad_value_(self.net_d.parameters(), None)
+            self.log(
+                "grad-norm_d", clip_grad_value_(self.net_d.parameters(), None)
             )
             optim_d.step()
             optim_d.zero_grad()
@@ -416,22 +384,33 @@ class VitsLightning(pl.LightningModule):
             return
         with torch.no_grad():
             self.net_g.eval()
-            x, x_lengths, sid, lid, y, y_lengths = batch
+            x, x_lengths, y, y_lengths, wav, wav_lengths, sid, lid = batch
             y_hat = self.net_g.infer(x, x_lengths, sid, lid)
             y_hat_mel = mel_spectrogram_torch(y_hat.squeeze(1).float(), self.hparams)
-            self.log_audio_dict(
-                {f"gen/audio_{batch_idx}": y_hat[0], f"gt/audio_{batch_idx}": y[0]}
-            )
-            self.log_image_dict(
-                {
-                    "gen/mel": utils.plot_spectrogram_to_numpy(
-                        y_hat_mel[0].cpu().float().numpy()
-                    ),
-                    "gt/mel": utils.plot_spectrogram_to_numpy(
+
+            audio_examples = []
+            audio_examples.append(wandb.Audio(y_hat[0].cpu().numpy(), caption='reconstructed_wav', sample_rate=self.sample_rate))
+            audio_examples.append(wandb.Audio(wav[0].cpu().numpy(), caption='target_wav', sample_rate=self.sample_rate))
+            self.logger.experiment.log({
+                "audios_val": audio_examples
+            })
+
+            image_examples = [
+                wandb.Image(
+                    utils.plot_spectrogram_to_numpy(
                         y[0].cpu().float().numpy()
                     ),
-                }
-            )
+                    caption='target_mel'
+                ),
+                wandb.Image(
+                    utils.plot_spectrogram_to_numpy(
+                        y_hat_mel[0].cpu().float().numpy()
+                    ),
+                    caption='gen_mel'
+                ),
+            ]
+
+            self.logger.experiment.log({"mel_plots_val": image_examples})
 
     def on_validation_end(self) -> None:
         self.save_checkpoints()
