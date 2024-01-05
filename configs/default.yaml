@@ -1,6 +1,8 @@
 train:
     log_interval: 100
     eval_interval: 200
+    # log_interval: 5
+    # eval_interval: 10
     seed: 1234
     epochs: 10000
     learning_rate: 0.0001
@@ -8,20 +10,21 @@ train:
         - 0.8
         - 0.99
     eps: 1e-9
-    batch_size: 16
+    batch_size: 32
     fp16_run: false
     bf16_run: false
     lr_decay: 0.999875
-    segment_size: 10240
+    segment_size: 8192
     init_lr_ratio: 1
     warmup_epochs: 0
     c_mel: 45
     c_kl: 1.0
+    c_prosody_kl: 0.001
     use_sr: true
     max_speclen: 512
     port: "8001"
     keep_ckpts: 3
-    num_workers: 4
+    num_workers: 12
     log_version: 0
     ckpt_name_by_step: false
     accumulate_grad_batches: 1
@@ -33,7 +36,7 @@ model:
     num_layers_text_encoder: 6
     kernel_size_text_encoder: 3
     dropout_p_text_encoder: 0.1
-    spec_channels: 80
+    spec_channels: 513
     kernel_size_posterior_encoder: 5
     dilation_rate_posterior_encoder: 1
     num_layers_posterior_encoder: 16
@@ -75,7 +78,6 @@ model:
         - 8
         - 2
         - 2
-    segment_size: 10240
 
 data:
     max_wav_value: 32768.0

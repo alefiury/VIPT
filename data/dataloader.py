@@ -39,7 +39,7 @@ class TextAudioLoader(torch.utils.data.Dataset):
             self.n_mel_channels = hparams.get("n_mel_channels", 80)
         self.cleaned_text = hparams.get("cleaned_text", False)
 
-        self.add_blank = hparams.add_blank
+        self.add_blank = hparams.get("add_blank", False)
         self.min_text_len = hparams.get("min_text_len", 1)
         self.max_text_len = hparams.get("max_text_len", 190)
 
@@ -101,7 +101,6 @@ class TextAudioLoader(torch.utils.data.Dataset):
 
     def get_audio_text_pair(self, audiopath_and_text):
         # separate filename and text
-        print(audiopath_and_text)
         audiopath, text, speaker_id, language_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
         text = self.get_text(text)
         spec, wav = self.get_audio(audiopath)

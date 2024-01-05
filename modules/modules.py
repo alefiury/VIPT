@@ -90,6 +90,19 @@ class ProsodyEncoder(nn.Module):
         return mu, logvar
 
 
+class Projection(nn.Module):
+    def __init__(self, hidden_channels, out_channels):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def forward(self, x, x_mask):
+        stats = self.proj(x) * x_mask
+        m_p, logs_p = torch.split(stats, self.out_channels, dim=1)
+        return m_p, logs_p
+
+
 class FramePriorNet(nn.Module):
     def __init__(
         self,
@@ -164,8 +177,8 @@ class LengthRegulator(torch.nn.Module):
 
         return pad
 
-    def forward(self, xs, ds, x_lengths):
-        ds = ds.squeeze(1) # (B, 1) -> (B)
+    def forward(self, xs, ds, x_lengths, y_length):
+        ds = ds.squeeze(1)
         if ds.sum() == 0:
             ds[ds.sum(dim=1).eq(0)] = 1
 
@@ -174,6 +187,11 @@ class LengthRegulator(torch.nn.Module):
         phn_repeat = [torch.repeat_interleave(x, d, dim=0) for x, d in zip(xs, ds)]
         output = self.pad_list(phn_repeat, self.pad_value)  # (B, D_frame, dim)
         output = torch.transpose(output, 1, 2)
+
+        # Force output to have the same length as y in the time dimension
+        if output.size(2) < y_length:
+            padding = output.new(output.size(0), output.size(1), y_length - output.size(2)).fill_(self.pad_value)
+            output = torch.cat([output, padding], dim=2)
 
         x_lengths = torch.LongTensor([len(i) for i in phn_repeat]).to(output.device)
 

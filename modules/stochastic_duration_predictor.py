@@ -186,12 +186,16 @@ class StochasticDurationPredictor(nn.Module):
         num_flows=4,
         cond_channels=0,
         language_emb_dim=0,
+        prosody_emb_dim=0,
     ):
         super().__init__()
 
         # add language embedding dim in the input
         if language_emb_dim:
             in_channels += language_emb_dim
+
+        if prosody_emb_dim:
+            in_channels += prosody_emb_dim
 
         # condition encoder text
         self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
@@ -219,7 +223,10 @@ class StochasticDurationPredictor(nn.Module):
         if language_emb_dim != 0 and language_emb_dim is not None:
             self.cond_lang = nn.Conv1d(language_emb_dim, hidden_channels, 1)
 
-    def forward(self, x, x_mask, dr=None, g=None, lang_emb=None, reverse=False, noise_scale=1.0):
+        if prosody_emb_dim != 0 and prosody_emb_dim is not None:
+            self.cond_prosody = nn.Conv1d(prosody_emb_dim, hidden_channels, 1)
+
+    def forward(self, x, x_mask, dr=None, g=None, lang_emb=None, prosody_emb=None, reverse=False, noise_scale=1.0):
         """
         Shapes:
             - x: :math:`[B, C, T]`
@@ -229,11 +236,15 @@ class StochasticDurationPredictor(nn.Module):
         """
         # condition encoder text
         x = self.pre(x)
+
         if g is not None:
             x = x + self.cond(g)
 
         if lang_emb is not None:
             x = x + self.cond_lang(lang_emb)
+
+        if prosody_emb is not None:
+            x = x + self.cond_prosody(prosody_emb)
 
         x = self.convs(x, x_mask)
         x = self.proj(x) * x_mask

@@ -7,19 +7,20 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 
-from modules.helpers import sequence_mask
+from modules.helpers import maximum_path
+from modules.helpers import sequence_mask, generate_path
 from modules.commons import rand_slice_segments
 from modules.hifigan_generator import HifiganGenerator
 from modules.duration_predictor import DurationPredictor
-from modules.modules import LengthRegulator, FramePriorNet
+from modules.modules import LengthRegulator, FramePriorNet, Projection
 from modules.modules import TextEncoder, PosteriorEncoder, ResidualCouplingBlocks, ProsodyEncoder
+from modules.stochastic_duration_predictor import StochasticDurationPredictor
 
 
 class VIPT(nn.Module):
     """
     Synthesizer for Training
     """
-
     def __init__(
         self,
         n_vocab: int,
@@ -52,11 +53,25 @@ class VIPT(nn.Module):
         upsample_initial_channel_decoder: int,
         upsample_rates_decoder: Sequence[int],
         segment_size: int,
+        use_sdp: bool = True,
+        detach_dp_input: bool = True,
+        inference_noise_scale_dp: float = 1.0,
+        length_scale: float = 1.0,
+        inference_noise_scale: float = 0.667,
+        encoder_sample_rate: int = None,
+        max_inference_len: int = None,
         **kwargs: Any,
     ):
         super().__init__()
 
+        self.use_sdp = use_sdp
         self.segment_size = segment_size
+        self.detach_dp_input = detach_dp_input
+        self.inference_noise_scale_dp = inference_noise_scale_dp
+        self.length_scale = length_scale
+        self.inference_noise_scale = inference_noise_scale
+        self.encoder_sample_rate = encoder_sample_rate
+        self.max_inference_len = max_inference_len
 
         if kwargs:
             warnings.warn(f"Unused arguments: {kwargs}")
@@ -93,15 +108,27 @@ class VIPT(nn.Module):
             cond_channels=embedded_speaker_dim,
         )
 
-        self.duration_predictor = DurationPredictor(
-            in_channels=hidden_channels+embedded_language_dim+prosody_emb_dim,
-            filter_channels=256,
-            kernel_size=3,
-            p_dropout=0.5,
-            gin_channels=embedded_speaker_dim
-        )
-
-        self.lr = LengthRegulator()
+        if use_sdp:
+            self.duration_predictor = StochasticDurationPredictor(
+                hidden_channels,
+                192,
+                3,
+                0.5,
+                4,
+                cond_channels=embedded_speaker_dim,
+                language_emb_dim=embedded_language_dim,
+                prosody_emb_dim=prosody_emb_dim,
+            )
+        else:
+            self.duration_predictor = DurationPredictor(
+                hidden_channels,
+                256,
+                3,
+                0.5,
+                cond_channels=embedded_speaker_dim,
+                language_emb_dim=embedded_language_dim,
+                prosody_emb_dim=prosody_emb_dim,
+            )
 
         self.flow = ResidualCouplingBlocks(
             channels=hidden_channels,
@@ -110,17 +137,6 @@ class VIPT(nn.Module):
             dilation_rate=dilation_rate_flow,
             num_layers=num_layers_flow,
             cond_channels=embedded_speaker_dim,
-        )
-
-        self.frame_prior_net = FramePriorNet(
-            n_vocab=n_vocab,
-            out_channels=hidden_channels+embedded_language_dim+prosody_emb_dim,
-            hidden_channels=hidden_channels+embedded_language_dim+prosody_emb_dim,
-            filter_channels=hidden_channels_ffn_text_encoder,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            kernel_size=kernel_size,
-            p_dropout=p_dropout,
         )
 
         self.waveform_decoder = HifiganGenerator(
@@ -147,6 +163,62 @@ class VIPT(nn.Module):
         std = torch.exp(0.5 * logvar)  # standard deviation
         eps = torch.randn_like(std)  # epsilon ~ N(0, 1)
         return mu + eps * std
+
+
+    def forward_mas(self, outputs, z_p, m_p, logs_p, x, x_mask, y_mask, g, lang_emb, prosody_emb):
+        # find the alignment path
+        attn_mask = torch.unsqueeze(x_mask, -1) * torch.unsqueeze(y_mask, 2)
+        with torch.no_grad():
+            o_scale = torch.exp(-2 * logs_p)
+            logp1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1]).unsqueeze(-1)  # [b, t, 1]
+            logp2 = torch.einsum("klm, kln -> kmn", [o_scale, -0.5 * (z_p**2)])
+            logp3 = torch.einsum("klm, kln -> kmn", [m_p * o_scale, z_p])
+            logp4 = torch.sum(-0.5 * (m_p**2) * o_scale, [1]).unsqueeze(-1)  # [b, t, 1]
+            logp = logp2 + logp3 + logp1 + logp4
+            attn = maximum_path(logp, attn_mask.squeeze(1)).unsqueeze(1).detach()  # [b, 1, t, t']
+
+        # duration predictor
+        attn_durations = attn.sum(3)
+        if self.use_sdp:
+            loss_duration = self.duration_predictor(
+                x.detach() if self.detach_dp_input else x,
+                x_mask,
+                attn_durations,
+                g=g.detach() if self.detach_dp_input and g is not None else g,
+                lang_emb=lang_emb.detach() if self.detach_dp_input and lang_emb is not None else lang_emb,
+                prosody_emb=prosody_emb.detach() if self.detach_dp_input and prosody_emb is not None else prosody_emb,
+            )
+            loss_duration = loss_duration / torch.sum(x_mask)
+        else:
+            attn_log_durations = torch.log(attn_durations + 1e-6) * x_mask
+            log_durations = self.duration_predictor(
+                x.detach() if self.detach_dp_input else x,
+                x_mask,
+                g=g.detach() if self.detach_dp_input and g is not None else g,
+                lang_emb=lang_emb.detach() if self.detach_dp_input and lang_emb is not None else lang_emb,
+                prosody_emb=prosody_emb.detach() if self.detach_dp_input and prosody_emb is not None else prosody_emb,
+            )
+            loss_duration = torch.sum((log_durations - attn_log_durations) ** 2, [1, 2]) / torch.sum(x_mask)
+        outputs["loss_duration"] = loss_duration
+        return outputs, attn
+
+    def upsampling_z(self, z, slice_ids=None, y_lengths=None, y_mask=None):
+        spec_segment_size = self.segment_size
+        if self.encoder_sample_rate:
+            # recompute the slices and spec_segment_size if needed
+            slice_ids = slice_ids * int(self.interpolate_factor) if slice_ids is not None else slice_ids
+            spec_segment_size = spec_segment_size * int(self.interpolate_factor)
+            # interpolate z if needed
+            if self.interpolate_z:
+                z = torch.nn.functional.interpolate(z, scale_factor=[self.interpolate_factor], mode="linear").squeeze(0)
+                # recompute the mask if needed
+                if y_lengths is not None and y_mask is not None:
+                    y_mask = (
+                        sequence_mask(y_lengths * self.interpolate_factor, None).to(y_mask.dtype).unsqueeze(1)
+                    )  # [B, 1, T_dec_resampled]
+
+        return z, spec_segment_size, slice_ids, y_mask
+
 
     def forward(
         self,
@@ -202,28 +274,6 @@ class VIPT(nn.Module):
         prosody_emb = self.reparameterize_vae(pros_mu, pros_logvar).unsqueeze(-1)
         # text encoder
         x, m_p, logs_p, x_mask = self.text_encoder(x, x_lengths, lang_emb=lang_emb, prosody_emb=prosody_emb)
-        # duration predictor
-        log_duration_prediction = self.duration_predictor(x, x_mask, g=g)
-        # duration predictor
-        duration_rounded = torch.clamp(
-            (torch.round(torch.exp(log_duration_prediction) - 1) * 1.0),
-            min=0,
-        ).long()
-
-        x_frame, x_lengths = self.lr(x, duration_rounded, x_lengths)
-
-        x_frame = x_frame.to(x.device)
-        x_mask = torch.unsqueeze(
-            sequence_mask(
-                x_lengths,
-                x_frame.size(2)
-            ),
-            1
-        ).to(x.dtype)
-
-        x_mask = x_mask.to(x.device)
-
-        x_frame = self.frame_prior_net(x_frame, x_mask)
 
         # posterior encoder
         z, m_q, logs_q, y_mask = self.posterior_encoder(y, y_lengths, g=g)
@@ -231,10 +281,23 @@ class VIPT(nn.Module):
         # flow layers
         z_p = self.flow(z, y_mask, g=g)
 
+        # duration predictor
+        outputs, attn = self.forward_mas(outputs, z_p, m_p, logs_p, x, x_mask, y_mask, g=g, lang_emb=lang_emb, prosody_emb=prosody_emb)
+
+        # expand prior
+        m_p = torch.einsum("klmn, kjm -> kjn", [attn, m_p])
+        logs_p = torch.einsum("klmn, kjm -> kjn", [attn, logs_p])
+
+        # # expand prior
+        # m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+        # logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+
+        # slice segments
         z_slice, ids_slice = rand_slice_segments(
             z, y_lengths, self.segment_size
         )
 
+        # vocoder
         o = self.waveform_decoder(z_slice, g=g)
 
         outputs.update(
@@ -242,13 +305,15 @@ class VIPT(nn.Module):
                 "model_outputs": o,
                 "ids_slice": ids_slice,
                 "x_mask": x_mask,
-                "y_mask": y_mask,
+                "z_mask": y_mask,
                 "m_p": m_p,
                 "logs_p": logs_p,
                 "z": z,
                 "z_p": z_p,
                 "m_q": m_q,
                 "logs_q": logs_q,
+                "pros_mu": pros_mu,
+                "pros_logvar": pros_logvar,
             }
         )
 
@@ -258,12 +323,11 @@ class VIPT(nn.Module):
         self,
         x: torch.tensor,
         x_lengths: torch.tensor,
-        y: torch.tensor,
-        y_lengths: torch.tensor,
         sid: torch.tensor,
         lid: torch.tensor,
+        y: torch.tensor,
+        y_lengths: torch.tensor
     ):
-        outputs = {}
         # speaker embedding
         g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         # language embedding
@@ -271,35 +335,47 @@ class VIPT(nn.Module):
         # prosody embedding
         pros_mu, pros_logvar = self.prosody_encoder(y)
         # reparameterize
-        prosody_emb = self.reparameterize_vae(pros_mu, pros_logvar)
+        prosody_emb = self.reparameterize_vae(pros_mu, pros_logvar).unsqueeze(-1)
         # text encoder
         x, m_p, logs_p, x_mask = self.text_encoder(x, x_lengths, lang_emb=lang_emb, prosody_emb=prosody_emb)
-        # duration predictor
-        log_duration_prediction = self.duration_predictor(x, x_mask, g=g)
-        # duration predictor
-        duration_rounded = torch.clamp(
-            (torch.round(torch.exp(log_duration_prediction) - 1) * 1.0),
-            min=0,
-        ).long()
 
-        x_frame, x_lengths = self.lr(x, duration_rounded, x_lengths)
+        if self.use_sdp:
+            logw = self.duration_predictor(
+                x,
+                x_mask,
+                g=g,
+                reverse=True,
+                noise_scale=self.inference_noise_scale_dp,
+                lang_emb=lang_emb,
+                prosody_emb=prosody_emb,
+            )
+        else:
+            logw = self.duration_predictor(
+                x,
+                x_mask,
+                g=g,
+                lang_emb=lang_emb,
+                prosody_emb=prosody_emb,
+            )
 
-        x_frame = x_frame.to(x.device)
-        x_mask = torch.unsqueeze(
-            sequence_mask(
-                x_lengths,
-                x_frame.size(2)
-            ),
-            1
-        ).to(x.dtype)
+        w = torch.exp(logw) * x_mask * self.length_scale
 
-        x_mask = x_mask.to(x.device)
+        w_ceil = torch.ceil(w)
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_mask = sequence_mask(y_lengths, None).to(x_mask.dtype).unsqueeze(1)  # [B, 1, T_dec]
 
-        z_p = self.frame_prior_net(x_frame, x_mask)
+        attn_mask = x_mask * y_mask.transpose(1, 2)  # [B, 1, T_enc] * [B, T_dec, 1]
+        attn = generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1).transpose(1, 2))
 
-        # flow layers
-        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        m_p = torch.matmul(attn.transpose(1, 2), m_p.transpose(1, 2)).transpose(1, 2)
+        logs_p = torch.matmul(attn.transpose(1, 2), logs_p.transpose(1, 2)).transpose(1, 2)
 
-        o = self.waveform_decoder(z, g=g)
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * self.inference_noise_scale
+        z = self.flow(z_p, y_mask, g=g, reverse=True)
+
+        # upsampling if needed
+        z, _, _, y_mask = self.upsampling_z(z, y_lengths=y_lengths, y_mask=y_mask)
+
+        o = self.waveform_decoder((z * y_mask)[:, :, : self.max_inference_len], g=g)
 
         return o

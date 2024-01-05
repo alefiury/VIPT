@@ -1,34 +1,22 @@
-from __future__ import annotations
-
-import os
 from typing import Dict
-import wandb
-import warnings
-from logging import getLogger
-from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Any
+from logging import getLogger
 
-import lightning.pytorch as pl
 import torch
-from lightning.pytorch.accelerators import MPSAccelerator, TPUAccelerator
-from lightning.pytorch.callbacks import DeviceStatsMonitor
-from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.strategies.ddp import DDPStrategy
-from lightning.pytorch.tuner import Tuner
+import wandb
+import lightning.pytorch as pl
 from torch.cuda.amp import autocast
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
-# from torch.utils.tensorboard.writer import SummaryWriter
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.accelerators import MPSAccelerator, TPUAccelerator
 
-from modules.model import VIPT
-from modules.descriminators import MultiPeriodDiscriminator
-from modules.commons import slice_segments, clip_grad_value_
-from modules.mel_processing import mel_spectrogram_torch
-from modules.losses import (kl_loss, feature_loss, discriminator_loss, generator_loss, prosody_kl_loss)
 import modules.utils as utils
+from modules.model import VIPT
+from data.text.symbols import symbols
+from modules.descriminators import MultiPeriodDiscriminator
 from modules.mel_processing import spec_to_mel_torch
+from modules.mel_processing import mel_spectrogram_torch
+from modules.commons import slice_segments, clip_grad_value_
+from modules.losses import (kl_loss, feature_loss, discriminator_loss, generator_loss, prosody_kl_loss)
 
 LOG = getLogger(__name__)
 torch.set_float32_matmul_precision("high")
@@ -45,10 +33,11 @@ class VIPTLightning(pl.LightningModule):
         self.automatic_optimization = False
         self.net_g = VIPT(
             **self.hparams.model,
-            n_vocab=hparams.n_vocab
+            segment_size=self.hparams.train.segment_size // self.hparams.data.hop_length,
+            n_vocab=len(symbols)
         )
 
-        self.net_d = MultiPeriodDiscriminator(self.hparams.model.use_spectral_norm)
+        self.net_d = MultiPeriodDiscriminator(self.hparams.data.use_spectral_norm)
 
         self.learning_rate = self.hparams.train.learning_rate
 
@@ -261,7 +250,7 @@ class VIPTLightning(pl.LightningModule):
     def configure_optimizers(self):
         return [self.optim_g, self.optim_d], [self.scheduler_g, self.scheduler_d]
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         self.net_g.train()
         self.net_d.train()
 
@@ -284,15 +273,15 @@ class VIPTLightning(pl.LightningModule):
         )
         y_hat_mel = mel_spectrogram_torch(output_dict["model_outputs"].float().squeeze(1), self.hparams)
         y_mel = y_mel[..., : y_hat_mel.shape[-1]]
-        y = slice_segments(
-            y,
+        wav = slice_segments(
+            wav,
             output_dict["ids_slice"] * self.hparams.data.hop_length,
             self.hparams.train.segment_size,
         )
-        y = y[..., : output_dict["model_outputs"].shape[-1]]
+        wav = wav[..., : output_dict["model_outputs"].shape[-1]]
 
         # generator loss
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.net_d(y, output_dict["model_outputs"])
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.net_d(wav, output_dict["model_outputs"])
 
         with autocast(enabled=False):
             loss_mel = F.l1_loss(y_mel, y_hat_mel) * self.hparams.train.c_mel
@@ -326,7 +315,7 @@ class VIPTLightning(pl.LightningModule):
                     caption='target_mel'
                 ),
                 wandb.Image(utils.plot_spectrogram_to_numpy(
-                        y_mel[0].data.cpu().float().numpy()
+                        y_hat_mel[0].data.cpu().float().numpy()
                     ),
                     caption='gen_mel'
                 ),
@@ -351,7 +340,7 @@ class VIPTLightning(pl.LightningModule):
         # Discriminator
         # train
         self.toggle_optimizer(optim_d)
-        y_d_hat_r, y_d_hat_g, _, _ = self.net_d(y, output_dict["model_outputs"].detach())
+        y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wav, output_dict["model_outputs"].detach())
 
         # discriminator loss
         with autocast(enabled=False):
@@ -385,12 +374,16 @@ class VIPTLightning(pl.LightningModule):
         with torch.no_grad():
             self.net_g.eval()
             x, x_lengths, y, y_lengths, wav, wav_lengths, sid, lid = batch
-            y_hat = self.net_g.infer(x, x_lengths, sid, lid)
+            y_mel = spec_to_mel_torch(
+                y,
+                self.hparams
+            )
+            y_hat = self.net_g.infer(x, x_lengths, sid, lid, y, y_lengths)
             y_hat_mel = mel_spectrogram_torch(y_hat.squeeze(1).float(), self.hparams)
 
             audio_examples = []
-            audio_examples.append(wandb.Audio(y_hat[0].cpu().numpy(), caption='reconstructed_wav', sample_rate=self.sample_rate))
-            audio_examples.append(wandb.Audio(wav[0].cpu().numpy(), caption='target_wav', sample_rate=self.sample_rate))
+            audio_examples.append(wandb.Audio(wav[0][0].cpu().numpy(), caption='target_wav', sample_rate=self.hparams.data.sampling_rate))
+            audio_examples.append(wandb.Audio(y_hat[0][0].cpu().numpy(), caption='reconstructed_wav', sample_rate=self.hparams.data.sampling_rate))
             self.logger.experiment.log({
                 "audios_val": audio_examples
             })
@@ -398,7 +391,7 @@ class VIPTLightning(pl.LightningModule):
             image_examples = [
                 wandb.Image(
                     utils.plot_spectrogram_to_numpy(
-                        y[0].cpu().float().numpy()
+                        y_mel[0].cpu().float().numpy()
                     ),
                     caption='target_mel'
                 ),
